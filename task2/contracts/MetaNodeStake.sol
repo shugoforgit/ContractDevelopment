@@ -93,15 +93,19 @@ contract MetaNodeStake is
         __AccessControl_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
         
         setMetaNode(_metaNodeAddress);
 
         startBlock = _startBlock;
         endBlock = _endBlock;
         metaNodePerBlock = _metaNodePerBlock;
+    }
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
+    function updatePool(uint256 _pid, uint256 _minDepositAmount, uint256 _unstakeLockedBlocks) public onlyRole(ADMIN_ROLE) checkPid(_pid) {
+        pools[_pid].minDepositAmount = _minDepositAmount;
+        pools[_pid].unstakeLockedBlocks = _unstakeLockedBlocks;
     }
 
     function setMetaNodePerBlock(uint256 _metaNodePerBlock) public onlyRole(ADMIN_ROLE) {
@@ -116,6 +120,30 @@ contract MetaNodeStake is
     function setEndBlock(uint256 _endBlock) public onlyRole(ADMIN_ROLE) {
         require(_endBlock >= startBlock, "End block must be greater than current end block");
         endBlock = _endBlock;
+    }
+
+    function poolLength() public view returns (uint256) {
+        return pools.length;
+    }
+
+    function pendingMetaNode(uint256 _pid, address _user) public view checkPid(_pid) returns (uint256) {
+        return pendingMetaNodeByBlockNumber(_pid, _user, block.number);
+    }
+    
+    function pendingMetaNodeByBlockNumber(uint256 _pid, address _user, uint256 _blockNumber) public view checkPid(_pid) returns (uint256) {
+        Pool storage pool_ = pools[_pid];
+        User storage user_ = users[_pid][_user];
+
+        uint256 accMetaNodePerST = pool_.accMetaNodePerST;
+        uint256 stSupply = pool_.stTokenAmount;
+
+        if (_blockNumber > pool_.lastRewardBlock) {
+            uint256 multiplier = getMultiplier(_blockNumber, pool_.lastRewardBlock);
+            uint256 MetaNodeForPool = multiplier * pool_.poolWeight / totalWeight; //  按权重 池子所分配到的全部metanode数量
+            accMetaNodePerST = accMetaNodePerST + MetaNodeForPool * (1 ether) / stSupply; // 按质押比例分配metanode
+        }
+
+        return user_.amount * accMetaNodePerST / (1 ether) - user_.finishedMetaNode + user_.pendingMetaNode;
     }
 
     function pauseWithdraw() public onlyRole(ADMIN_ROLE) {
@@ -148,8 +176,26 @@ contract MetaNodeStake is
         MetaNode = IERC20(_metaNodeAddress);
     }
 
-    function setPoolWeight(uint256 _pid, uint256 _poolWeight) public onlyRole(ADMIN_ROLE) checkPid(_pid) {
+    function setPoolWeight(uint256 _pid, uint256 _poolWeight, bool _withUpdate) public onlyRole(ADMIN_ROLE) checkPid(_pid) {
+        require(_poolWeight > 0, "Pool weight must be greater than 0");
+
+        if (_withUpdate) {
+            massUpdatePools();
+        }
+
+        totalWeight = totalWeight - pools[_pid].poolWeight + _poolWeight;
         pools[_pid].poolWeight = _poolWeight;
+    }
+
+    function stakingBalance(uint256 _pid, address _user) public view checkPid(_pid) returns (uint256) {
+        return users[_pid][_user].amount;
+    }
+
+    function massUpdatePools() public {
+        uint256 length = pools.length;
+        for (uint256 i = 0; i < length; i++) {
+            updatePool(i);
+        }
     }
 
     function addPool(address _poolAddress, uint256 _poolWeight, uint256 _minDepositAmount, uint256 _unstakeLockedBlocks) public onlyRole(ADMIN_ROLE) {
@@ -220,7 +266,7 @@ contract MetaNodeStake is
             user_.amount = userAmount;
         }
 
-        (bool succ5, uint256 stTokenAmount) = user_.amount.tryAdd(pool_.stTokenAmount);
+        (bool succ5, uint256 stTokenAmount) = _amount.tryAdd(pool_.stTokenAmount);
         require(succ5, "StTokenAmount overflow");
         pool_.stTokenAmount = stTokenAmount;
 
@@ -245,19 +291,20 @@ contract MetaNodeStake is
         (succ, totalMetaNode) = totalMetaNode.tryDiv(totalWeight);
         require(succ, "MetaNodePerST overflow");
         
-        if (totalMetaNode > 0) {
+        uint256 stSupply = pool_.stTokenAmount;
+        if (stSupply > 0) {
             (bool succ2, uint256 totalMetaNode_) = totalMetaNode.tryMul(1 ether);
             require(succ, "TotalMetaNode overflow");
 
-            (succ2, totalMetaNode_) = totalMetaNode_.tryDiv(pool_.stTokenAmount);
+            (succ2, totalMetaNode_) = totalMetaNode_.tryDiv(stSupply);
             require(succ2, "MetaNodePerST overflow");
 
             (bool succ3, uint256 accMetaNodePerST_) = pool_.accMetaNodePerST.tryAdd(totalMetaNode_);
             require(succ3, "AccMetaNodePerST overflow");
-            pool_.accMetaNodePerST = accMetaNodePerST_;
-
-            pool_.lastRewardBlock = block.number;
+            pool_.accMetaNodePerST = accMetaNodePerST_;    
         }
+
+        pool_.lastRewardBlock = block.number;
     }
 
     function getMultiplier(uint256 _lastBlock, uint256 _startBlock) public view returns (uint256 multiplier) {
@@ -275,7 +322,7 @@ contract MetaNodeStake is
         Pool storage pool_ = pools[_pid];
         User storage user_ = users[_pid][msg.sender];
 
-        require(_amount > user_.amount, "Amount must be greater than user amount");
+        require(_amount <= user_.amount, "Amount must be greater than user amount");
 
         updatePool(_pid);
 
@@ -301,8 +348,6 @@ contract MetaNodeStake is
         Pool storage pool_ = pools[_pid];
         User storage user_ = users[_pid][msg.sender];
 
-        require(pool_.poolAddress == address(0x0), "ETH staking is full");
-
         uint256 pendingWithdram_ = 0;
         uint256 popNum_ = 0;
         for (uint256 i = 0; i < user_.requests.length; i++) {
@@ -312,6 +357,10 @@ contract MetaNodeStake is
 
             pendingWithdram_ += user_.requests[i].amount;
             popNum_++;
+        }
+
+        for (uint256 i = 0; i < user_.requests.length - popNum_; i++) {
+            user_.requests[i] = user_.requests[i + popNum_];
         }
 
         for (uint256 i = 0; i < popNum_; i++) {
@@ -324,6 +373,18 @@ contract MetaNodeStake is
             } else {
                 IERC20(pool_.poolAddress).safeTransfer(msg.sender, pendingWithdram_);
             }
+        }
+    }
+
+    function withdrawAmount(uint256 _pid, address _user) public view checkPid(_pid) returns (uint256 requestAmount, uint256 pendingWithdrawAmount) {
+        User storage user_ = users[_pid][_user];
+
+        for (uint256 i = 0; i < user_.requests.length; i++) {
+            if (user_.requests[i].unlockBlock < block.number) {
+                pendingWithdrawAmount += user_.requests[i].amount;
+            }
+
+            requestAmount += user_.requests[i].amount;
         }
     }
 
